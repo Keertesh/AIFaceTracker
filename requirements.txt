@@ -4,3 +4,7 @@ mediapipe>=0.10.0
 insightface>=0.7.3
 onnxruntime>=1.16.0
 numpy>=1.23.0
+
+# Voice input (microphone capture + Google Web Speech API)
+SpeechRecognition>=3.10.0
+sounddevice>=0.4.6

@@ -31,6 +31,7 @@ import pickle
 import queue
 import random
 import subprocess
+import wave
 from collections import deque
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +176,14 @@ try:
 except Exception as e:
     print(f"[WARN] InsightFace unavailable: {e}")
 
+_SR_OK = False
+try:
+    import speech_recognition as _sr
+    import sounddevice as _sd
+    _SR_OK = True
+except Exception as e:
+    print(f"[WARN] SpeechRecognition / sounddevice unavailable: {e}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Speaker  (macOS `say` — non-blocking)
@@ -219,9 +228,119 @@ class Speaker:
                 pass
         self._busy.clear()
 
+    def wait(self, timeout: float = 10.0):
+        """Block until any currently-speaking TTS finishes (or timeout)."""
+        deadline = time.time() + timeout
+        while self._busy.is_set() and time.time() < deadline:
+            time.sleep(0.05)
+
     @property
     def is_busy(self) -> bool:
         return self._busy.is_set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Voice input  (microphone → text via SpeechRecognition + Google Web API)
+# ─────────────────────────────────────────────────────────────────────────────
+_AUDIO_DIR = os.path.join(_MODEL_DIR, "audio")
+
+
+class VoiceInput:
+    """
+    Records audio from the default microphone, saves it as WAV, and
+    converts it to text using Google's free Web Speech API.
+
+    Shared state (`status`) is read by the main render loop to draw a
+    big "● RECORDING …" badge over the video while capture is active.
+    """
+
+    SAMPLE_RATE = 16000   # 16 kHz mono — what Google's API expects
+    DURATION    = 4.0     # seconds per name capture
+    LANGUAGE    = "en-US"
+
+    def __init__(self):
+        os.makedirs(_AUDIO_DIR, exist_ok=True)
+        self._recog = _sr.Recognizer() if _SR_OK else None
+        # Live state for the UI
+        self.status: dict = {"phase": "idle",   # idle | listening | thinking | done | error
+                             "ends_at": 0.0,
+                             "text":   "",
+                             "error":  ""}
+
+    @property
+    def available(self) -> bool:
+        return _SR_OK and self._recog is not None
+
+    def capture_name(self) -> tuple:
+        """
+        Blocking call (run in its own thread):
+          1. record DURATION seconds of mono 16 kHz audio
+          2. save WAV to ~/.face_tracker/audio/name_<ts>.wav
+          3. transcribe with Google Web Speech API
+          4. update self.status throughout for the UI
+        Returns (recognized_text, wav_path) — text is "" on failure.
+        """
+        if not self.available:
+            self.status.update(phase="error", error="SR unavailable")
+            return "", ""
+
+        # ── 1. Record ────────────────────────────────────────────────────────
+        self.status.update(phase="listening",
+                           ends_at=time.time() + self.DURATION,
+                           text="", error="")
+        try:
+            audio = _sd.rec(int(self.DURATION * self.SAMPLE_RATE),
+                            samplerate=self.SAMPLE_RATE,
+                            channels=1, dtype="int16")
+            _sd.wait()
+        except Exception as e:
+            self.status.update(phase="error", error=f"mic error: {e}")
+            return "", ""
+
+        # ── 2. Save WAV ──────────────────────────────────────────────────────
+        ts        = int(time.time())
+        wav_path  = os.path.join(_AUDIO_DIR, f"name_{ts}.wav")
+        try:
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)              # 16-bit PCM
+                wf.setframerate(self.SAMPLE_RATE)
+                wf.writeframes(audio.tobytes())
+        except Exception as e:
+            print(f"[WARN] Could not save audio: {e}")
+            wav_path = ""
+
+        # ── 3. Transcribe ────────────────────────────────────────────────────
+        self.status.update(phase="thinking")
+        try:
+            sr_audio = _sr.AudioData(audio.tobytes(), self.SAMPLE_RATE, 2)
+            text     = self._recog.recognize_google(sr_audio,
+                                                    language=self.LANGUAGE)
+            text     = text.strip()
+            self.status.update(phase="done", text=text, ends_at=time.time())
+            # Persist transcript next to the WAV for traceability
+            if wav_path:
+                try:
+                    with open(wav_path.replace(".wav", ".txt"), "w") as f:
+                        f.write(text + "\n")
+                except Exception:
+                    pass
+            print(f"[VOICE] Heard: '{text}'  → {wav_path}")
+            return text, wav_path
+        except _sr.UnknownValueError:
+            self.status.update(phase="error", error="couldn't understand",
+                               ends_at=time.time())
+            print("[VOICE] Could not understand the audio.")
+            return "", wav_path
+        except _sr.RequestError as e:
+            self.status.update(phase="error", error="no internet",
+                               ends_at=time.time())
+            print(f"[VOICE] STT service error (offline?): {e}")
+            return "", wav_path
+        except Exception as e:
+            self.status.update(phase="error", error=str(e)[:30],
+                               ends_at=time.time())
+            return "", wav_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -744,14 +863,32 @@ def main():
     recog: dict = {}
     last_greeted: dict = {}   # name -> timestamp
 
-    # ── Name-input pipeline ───────────────────────────────────────────────────
+    # ── Name-input pipeline (voice) ───────────────────────────────────────────
+    voice_in  = VoiceInput()
     name_q    = queue.Queue()   # background thread drops name here
     asking_fid: str | None = None
 
     def _ask_name_thread():
+        """Speak prompt → record audio → STT → enqueue name (or fall back to typing)."""
+        speaker.say("Hello! Please say your name after the beep, "
+                    "and I will remember you.", interrupt=True)
+        speaker.wait()
+        # Short audible beep so the user knows recording started
+        subprocess.Popen(["afplay", "/System/Library/Sounds/Tink.aiff"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.35)
+
+        text, wav = voice_in.capture_name()
+        if text:
+            name_q.put(text)
+            return
+
+        # Voice failed → spoken apology + terminal fallback
+        speaker.say("Sorry, I didn't catch that. "
+                    "Please type your name in the terminal instead.")
         print("\n" + "═"*50)
-        print("  TYPE THE PERSON'S NAME and press Enter:")
-        print("  (or press Enter to skip)")
+        print("  Voice recognition failed.  TYPE the name + Enter:")
+        print("  (or just press Enter to skip)")
         print("═"*50 + "\n>>> ", end="", flush=True)
         try:
             entered = input().strip()
@@ -760,8 +897,10 @@ def main():
         name_q.put(entered)
 
     print("=" * 65)
-    print("  Face Tracker v3  |  Voice Recognition + Emotion Greetings")
+    print("  Face Tracker v4  |  Voice Capture + Recognition + 14 Emotions")
     print("  Press  Q  to quit.")
+    print(f"  Voice input : {'enabled' if voice_in.available else 'DISABLED (typing only)'}")
+    print(f"  Audio dir   : {_AUDIO_DIR}")
     if known.all_names():
         print(f"  Known people: {', '.join(known.all_names())}")
     print("=" * 65)
@@ -1061,7 +1200,7 @@ def main():
         known_names = known.all_names()
         known_str   = f"  KNOWN: {', '.join(known_names)}" if known_names else ""
         _txt(display,
-             f"  FACE TRACKER v3"
+             f"  FACE TRACKER v4"
              f"   FACES: {len(boxes)}"
              f"   FPS: {fps:4.1f}"
              f"   FRAME: {frame_n:05d}"
@@ -1069,11 +1208,54 @@ def main():
              f"   [ Q ] QUIT",
              8, 24, ACCENT, scale=0.58, thick=1)
 
+        # ── Voice-capture overlay (big centre badge) ──────────────────────────
+        vphase = voice_in.status["phase"]
+        if vphase in ("listening", "thinking", "done", "error"):
+            # Auto-clear "done"/"error" after a short display window
+            if vphase in ("done", "error") \
+               and now - voice_in.status.get("ends_at", now) > 2.5:
+                voice_in.status["phase"] = "idle"
+            else:
+                bw, bh = 520, 160
+                bx, by = (W - bw) // 2, (H - bh) // 2 - 40
+                ov = display.copy()
+                bgc = {"listening": (0, 0, 200),
+                       "thinking":  (60, 60, 60),
+                       "done":      (0, 140, 0),
+                       "error":     (40, 40, 120)}.get(vphase, (40, 40, 40))
+                cv2.rectangle(ov, (bx, by), (bx+bw, by+bh), bgc, -1)
+                cv2.addWeighted(ov, 0.78, display, 0.22, 0, display)
+                cv2.rectangle(display, (bx, by), (bx+bw, by+bh),
+                              (255, 255, 255), 2)
+
+                if vphase == "listening":
+                    secs = max(0.0, voice_in.status["ends_at"] - now)
+                    dot  = "●" if (frame_n // 8) % 2 == 0 else "○"
+                    _txt(display, f"{dot}  RECORDING",
+                         bx + 130, by + 60, (255, 255, 255), scale=1.1, thick=2)
+                    _txt(display, f"Say your name now... {secs:3.1f}s",
+                         bx + 90, by + 115, (255, 255, 255), scale=0.7, thick=1)
+                elif vphase == "thinking":
+                    _txt(display, "TRANSCRIBING...",
+                         bx + 110, by + 60, (255, 255, 255), scale=1.1, thick=2)
+                    _txt(display, "Converting speech to text via Google API",
+                         bx + 55, by + 115, (220, 220, 220), scale=0.55, thick=1)
+                elif vphase == "done":
+                    _txt(display, "HEARD:",
+                         bx + 30, by + 55, (255, 255, 255), scale=0.7, thick=1)
+                    _txt(display, f'"{voice_in.status["text"]}"',
+                         bx + 30, by + 115, (255, 255, 255), scale=1.0, thick=2)
+                else:   # error
+                    _txt(display, "VOICE ERROR",
+                         bx + 130, by + 60, (255, 255, 255), scale=1.0, thick=2)
+                    _txt(display, voice_in.status.get("error", ""),
+                         bx + 30, by + 115, (240, 200, 200), scale=0.6, thick=1)
+
         # Screen centre guide
         cv2.line(display, (W//2-14, H//2), (W//2+14, H//2), (48, 52, 62), 1)
         cv2.line(display, (W//2, H//2-14), (W//2, H//2+14), (48, 52, 62), 1)
 
-        cv2.imshow("Face Tracker v3  —  Voice + Recognition", display)
+        cv2.imshow("Face Tracker v4  —  Voice + Recognition", display)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
