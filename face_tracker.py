@@ -84,6 +84,15 @@ EMOTIONS = [
 RECOGNITION_THRESHOLD = 0.38
 GREETING_COOLDOWN_S   = 25
 
+# Anti-noise gating for the "ask for name" prompt:
+ASK_MIN_FACE_PX        = 130   # face must be at least this wide AND tall
+ASK_EDGE_MARGIN_PX     = 14    # face must not touch the frame edge
+ASK_MAX_HEAD_ANGLE     = 25    # |yaw|, |pitch| must be ≤ this many degrees
+ASK_STABLE_FRAMES      = 5     # consecutive UNKNOWN cycles before prompting
+ASK_FAILURE_COOLDOWN_S = 15    # cooldown after a skip / unrecognised attempt
+ASK_RECENT_SIM_THRESH  = 0.40  # don't re-prompt if embedding ~matches a recent ask
+ASK_RECENT_TTL_S       = 60    # how long a recent-ask embedding stays remembered
+
 # Spoken phrases per emotion (variety for naturalness)
 _EMO_PHRASES = {
     "HAPPY":         ["really happy",        "full of joy",          "absolutely joyful",   "so cheerful"],
@@ -395,6 +404,19 @@ class KnownFaces:
     def all_names(self) -> list:
         with self._lock:
             return [r["name"] for r in self._faces]
+
+    def clear(self) -> int:
+        """Delete every known face. Returns the count that was removed."""
+        with self._lock:
+            n = len(self._faces)
+            self._faces.clear()
+            try:
+                if os.path.exists(_FACES_FILE):
+                    os.remove(_FACES_FILE)
+            except Exception:
+                pass
+        print(f"[INFO] Cleared {n} known face(s).")
+        return n
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -868,8 +890,45 @@ def main():
     name_q    = queue.Queue()   # background thread drops name here
     asking_fid: str | None = None
 
+    # Anti-noise gating state for the "ask" flow
+    unknown_streak: dict = {}              # fid -> consecutive UNKNOWN cycles
+    last_ask_failed_at: float = 0.0        # global cooldown after a skip
+    recent_asks: list = []                 # [(timestamp, embedding), …]
+
+    # Reset-confirmation state (two-press R)
+    reset_pending_until: float = 0.0
+
+    # Last per-fid head pose (set later in the render pass; we need it here
+    # for the quality gate, so seed with zeros).
+    head_pose: dict = {}                   # fid -> (yaw, pitch, roll)
+
+    def _recently_asked(emb) -> bool:
+        if emb is None:
+            return False
+        cutoff = time.time() - ASK_RECENT_TTL_S
+        recent_asks[:] = [(t, e) for t, e in recent_asks if t > cutoff]
+        for _, e in recent_asks:
+            if float(np.dot(emb, e)) > ASK_RECENT_SIM_THRESH:
+                return True
+        return False
+
+    def _good_quality_for_ask(box, frame_w, frame_h, yaw, pitch) -> bool:
+        x, y, w, h = box
+        if w < ASK_MIN_FACE_PX or h < ASK_MIN_FACE_PX:
+            return False
+        if x < ASK_EDGE_MARGIN_PX or y < ASK_EDGE_MARGIN_PX:
+            return False
+        if x + w > frame_w - ASK_EDGE_MARGIN_PX:
+            return False
+        if y + h > frame_h - ASK_EDGE_MARGIN_PX:
+            return False
+        if abs(yaw) > ASK_MAX_HEAD_ANGLE or abs(pitch) > ASK_MAX_HEAD_ANGLE:
+            return False
+        return True
+
     def _ask_name_thread():
         """Speak prompt → record audio → STT → enqueue name (or fall back to typing)."""
+        nonlocal last_ask_failed_at
         speaker.say("Hello! Please say your name after the beep, "
                     "and I will remember you.", interrupt=True)
         speaker.wait()
@@ -894,11 +953,14 @@ def main():
             entered = input().strip()
         except EOFError:
             entered = ""
+        if not entered:
+            # Skipped → arm the failure cooldown so we don't immediately re-ask
+            last_ask_failed_at = time.time()
         name_q.put(entered)
 
     print("=" * 65)
     print("  Face Tracker v4  |  Voice Capture + Recognition + 14 Emotions")
-    print("  Press  Q  to quit.")
+    print("  Q = quit       R (twice) = wipe ALL known faces")
     print(f"  Voice input : {'enabled' if voice_in.available else 'DISABLED (typing only)'}")
     print(f"  Audio dir   : {_AUDIO_DIR}")
     if known.all_names():
@@ -943,6 +1005,12 @@ def main():
         for k in list(recog):
             if k not in active:
                 del recog[k]
+        for k in list(unknown_streak):
+            if k not in active:
+                del unknown_streak[k]
+        for k in list(head_pose):
+            if k not in active:
+                del head_pose[k]
         if asking_fid and asking_fid not in active:
             asking_fid = None   # face went away while asking
 
@@ -995,14 +1063,36 @@ def main():
                 else:
                     recog[fid] = {"name": None, "sim": sim, "status": "UNKNOWN"}
 
-            # If still unknown and not currently asking → ask for name
+            # ── Anti-noise gating for the "ask" prompt ────────────────────────
+            #   We only prompt if ALL of the following hold:
+            #     1. status is UNKNOWN (face seen, embedding doesn't match anyone)
+            #     2. no ask is currently in progress
+            #     3. nothing queued from a previous ask
+            #     4. embedding is available (else we couldn't save it anyway)
+            #     5. face is good quality (big enough, not edge-clipped, frontal)
+            #     6. UNKNOWN for ≥ ASK_STABLE_FRAMES consecutive cycles
+            #     7. global cooldown after a previous skip has elapsed
+            #     8. embedding wasn't already asked recently (no re-prompt loops)
             rec_status = recog.get(fid, {}).get("status", "LOADING")
-            if rec_status == "UNKNOWN" and asking_fid is None \
-               and not name_q.qsize() and emb is not None:
+
+            if rec_status == "UNKNOWN":
+                unknown_streak[fid] = unknown_streak.get(fid, 0) + 1
+            else:
+                unknown_streak[fid] = 0
+
+            yaw_f, pitch_f, _ = head_pose.get(fid, (0.0, 0.0, 0.0))
+
+            if (rec_status == "UNKNOWN"
+                    and asking_fid is None
+                    and not name_q.qsize()
+                    and emb is not None
+                    and unknown_streak.get(fid, 0) >= ASK_STABLE_FRAMES
+                    and (now - last_ask_failed_at) > ASK_FAILURE_COOLDOWN_S
+                    and _good_quality_for_ask((x, y, w, h), W, H, yaw_f, pitch_f)
+                    and not _recently_asked(emb)):
                 asking_fid = fid
                 recog[fid]["status"] = "ASKING"
-                speaker.say("Hello! I see a new face. "
-                            "Please type your name in the terminal and press Enter.")
+                recent_asks.append((time.time(), emb.copy()))
                 threading.Thread(target=_ask_name_thread, daemon=True).start()
 
             # If KNOWN face emotion changes significantly → spoken emotion update
@@ -1050,6 +1140,9 @@ def main():
                     sm_pc        = smile_pct(blendshapes)
                 if matrix is not None:
                     yaw, pitch, roll = matrix_to_euler(matrix)
+
+            # Cache head pose so the next frame's ask-gate can read it
+            head_pose[fid] = (yaw, pitch, roll)
 
             scores   = dict(state.scores)
             dominant = state.dominant
@@ -1205,8 +1298,8 @@ def main():
              f"   FPS: {fps:4.1f}"
              f"   FRAME: {frame_n:05d}"
              f"{known_str}"
-             f"   [ Q ] QUIT",
-             8, 24, ACCENT, scale=0.58, thick=1)
+             f"   [ R ] RESET   [ Q ] QUIT",
+             8, 24, ACCENT, scale=0.55, thick=1)
 
         # ── Voice-capture overlay (big centre badge) ──────────────────────────
         vphase = voice_in.status["phase"]
@@ -1251,13 +1344,49 @@ def main():
                     _txt(display, voice_in.status.get("error", ""),
                          bx + 30, by + 115, (240, 200, 200), scale=0.6, thick=1)
 
+        # ── Reset-confirmation overlay (after first 'R' press) ────────────────
+        if now < reset_pending_until:
+            secs = reset_pending_until - now
+            bw, bh = 560, 130
+            bx, by = (W - bw) // 2, H - bh - 70
+            ov = display.copy()
+            cv2.rectangle(ov, (bx, by), (bx+bw, by+bh), (0, 60, 180), -1)
+            cv2.addWeighted(ov, 0.82, display, 0.18, 0, display)
+            cv2.rectangle(display, (bx, by), (bx+bw, by+bh), (255, 255, 255), 2)
+            _txt(display, "PRESS  R  AGAIN  TO  CONFIRM  RESET",
+                 bx + 30, by + 55, (255, 255, 255), scale=0.75, thick=2)
+            _txt(display, f"Any other key cancels   ({secs:.1f}s)",
+                 bx + 30, by + 100, (220, 220, 220), scale=0.55, thick=1)
+
         # Screen centre guide
         cv2.line(display, (W//2-14, H//2), (W//2+14, H//2), (48, 52, 62), 1)
         cv2.line(display, (W//2, H//2-14), (W//2, H//2+14), (48, 52, 62), 1)
 
         cv2.imshow("Face Tracker v4  —  Voice + Recognition", display)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+
+        # ── Key handling ──────────────────────────────────────────────────────
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
+        elif key == ord("r"):
+            if now < reset_pending_until:
+                # Second press within window → confirm
+                n = known.clear()
+                recog.clear()
+                last_greeted.clear()
+                recent_asks.clear()
+                unknown_streak.clear()
+                speaker.say(f"All {n} known faces have been reset."
+                            if n else "There were no faces to reset.",
+                            interrupt=True)
+                reset_pending_until = 0.0
+            else:
+                # First press → arm
+                reset_pending_until = now + 3.0
+                speaker.say("Press R again to confirm reset.", interrupt=True)
+        elif key != 255 and now < reset_pending_until:
+            # Any other key cancels a pending reset
+            reset_pending_until = 0.0
 
     cap.release()
     cv2.destroyAllWindows()
