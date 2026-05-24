@@ -14,8 +14,9 @@ Face Tracker v4 — 14-Emotion Detection + Voice Recognition
 
 Workflow
 --------
-  New face detected  → "Hello! I see a new face. Type your name + Enter."
-  Name entered       → "Nice to meet you, <Name>! I'll remember you."
+  New face detected  → on-screen banner "PLEASE TELL ME YOUR NAME" → beep
+                       → 4 s mic capture → STT → save
+  Name entered       → "Nice to meet you, <Name>!"
   Known face returns → "I can see you <Name>! You look <emotion> today!"
 
 Press Q to quit.
@@ -927,16 +928,36 @@ def main():
             return False
         return True
 
+    # Pick the first available system sound as the "start recording" beep.
+    # Glass is louder/sharper than Tink — easier to hear over fan noise.
+    _BEEPS = ["/System/Library/Sounds/Glass.aiff",
+              "/System/Library/Sounds/Sosumi.aiff",
+              "/System/Library/Sounds/Tink.aiff",
+              "/System/Library/Sounds/Pop.aiff"]
+    _beep_file = next((p for p in _BEEPS if os.path.exists(p)), None)
+
     def _ask_name_thread():
-        """Speak prompt → record audio → STT → enqueue name (or fall back to typing)."""
+        """Show on-screen prompt → beep → record audio → STT → enqueue name."""
         nonlocal last_ask_failed_at
-        speaker.say("Hello! Please say your name after the beep, "
-                    "and I will remember you.", interrupt=True)
-        speaker.wait()
-        # Short audible beep so the user knows recording started
-        subprocess.Popen(["afplay", "/System/Library/Sounds/Tink.aiff"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.35)
+
+        # ── Show prompt on screen for 2.5 s (no spoken instruction — it
+        #    used to bleed into the mic recording) ────────────────────────────
+        PROMPT_DURATION = 2.5
+        voice_in.status.update(phase="prompt",
+                               ends_at=time.time() + PROMPT_DURATION,
+                               text="", error="")
+        time.sleep(PROMPT_DURATION)
+
+        # ── Audible beep right before recording (blocking, so the mic
+        #    can't pick it up) ────────────────────────────────────────────────
+        if _beep_file:
+            try:
+                subprocess.run(["afplay", "-v", "1.5", _beep_file],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL,
+                               timeout=2.0)
+            except Exception:
+                pass
 
         text, wav = voice_in.capture_name()
         if text:
@@ -1038,8 +1059,8 @@ def main():
                     known.add(entered_name, emb)
                     recog[asking_fid] = {"name": entered_name,
                                          "sim": 1.0, "status": "KNOWN"}
-                    speaker.say(f"Nice to meet you, {entered_name}! "
-                                f"I'll remember you.", interrupt=True)
+                    speaker.say(f"Nice to meet you, {entered_name}!",
+                                interrupt=True)
                     last_greeted[entered_name] = now
                 else:
                     speaker.say(f"I couldn't capture your face properly. "
@@ -1316,46 +1337,59 @@ def main():
 
         # ── Voice-capture overlay (big centre badge) ──────────────────────────
         vphase = voice_in.status["phase"]
-        if vphase in ("listening", "thinking", "done", "error"):
+        if vphase in ("prompt", "listening", "thinking", "done", "error"):
             # Auto-clear "done"/"error" after a short display window
             if vphase in ("done", "error") \
                and now - voice_in.status.get("ends_at", now) > 2.5:
                 voice_in.status["phase"] = "idle"
             else:
-                bw, bh = 520, 160
+                bw, bh = 600, 170
                 bx, by = (W - bw) // 2, (H - bh) // 2 - 40
                 ov = display.copy()
-                bgc = {"listening": (0, 0, 200),
-                       "thinking":  (60, 60, 60),
-                       "done":      (0, 140, 0),
-                       "error":     (40, 40, 120)}.get(vphase, (40, 40, 40))
+                bgc = {"prompt":    (0, 110, 210),   # amber/orange  (get-ready)
+                       "listening": (0,   0, 210),   # red           (recording)
+                       "thinking":  (60, 60,  60),   # grey
+                       "done":      (0, 140,   0),   # green
+                       "error":     (40, 40, 120),   # dark red
+                       }.get(vphase, (40, 40, 40))
                 cv2.rectangle(ov, (bx, by), (bx+bw, by+bh), bgc, -1)
-                cv2.addWeighted(ov, 0.78, display, 0.22, 0, display)
+                cv2.addWeighted(ov, 0.82, display, 0.18, 0, display)
                 cv2.rectangle(display, (bx, by), (bx+bw, by+bh),
                               (255, 255, 255), 2)
 
-                if vphase == "listening":
+                if vphase == "prompt":
+                    secs = max(0.0, voice_in.status["ends_at"] - now)
+                    _txt(display, "PLEASE  TELL  ME  YOUR  NAME",
+                         bx + 40, by + 70, (255, 255, 255), scale=0.95, thick=2)
+                    _txt(display, f"Recording will start in {secs:3.1f}s  (beep)",
+                         bx + 80, by + 125, (240, 240, 240),
+                         scale=0.62, thick=1)
+                elif vphase == "listening":
                     secs = max(0.0, voice_in.status["ends_at"] - now)
                     dot  = "●" if (frame_n // 8) % 2 == 0 else "○"
                     _txt(display, f"{dot}  RECORDING",
-                         bx + 130, by + 60, (255, 255, 255), scale=1.1, thick=2)
+                         bx + 170, by + 70, (255, 255, 255), scale=1.15, thick=2)
                     _txt(display, f"Say your name now... {secs:3.1f}s",
-                         bx + 90, by + 115, (255, 255, 255), scale=0.7, thick=1)
+                         bx + 130, by + 125, (255, 255, 255),
+                         scale=0.72, thick=1)
                 elif vphase == "thinking":
                     _txt(display, "TRANSCRIBING...",
-                         bx + 110, by + 60, (255, 255, 255), scale=1.1, thick=2)
-                    _txt(display, "Converting speech to text via Google API",
-                         bx + 55, by + 115, (220, 220, 220), scale=0.55, thick=1)
+                         bx + 150, by + 70, (255, 255, 255), scale=1.15, thick=2)
+                    _txt(display, "Converting speech to text",
+                         bx + 130, by + 125, (220, 220, 220),
+                         scale=0.62, thick=1)
                 elif vphase == "done":
                     _txt(display, "HEARD:",
-                         bx + 30, by + 55, (255, 255, 255), scale=0.7, thick=1)
+                         bx + 40, by + 60, (255, 255, 255), scale=0.7, thick=1)
                     _txt(display, f'"{voice_in.status["text"]}"',
-                         bx + 30, by + 115, (255, 255, 255), scale=1.0, thick=2)
+                         bx + 40, by + 125, (255, 255, 255),
+                         scale=1.05, thick=2)
                 else:   # error
                     _txt(display, "VOICE ERROR",
-                         bx + 130, by + 60, (255, 255, 255), scale=1.0, thick=2)
+                         bx + 170, by + 70, (255, 255, 255), scale=1.05, thick=2)
                     _txt(display, voice_in.status.get("error", ""),
-                         bx + 30, by + 115, (240, 200, 200), scale=0.6, thick=1)
+                         bx + 40, by + 125, (240, 200, 200),
+                         scale=0.65, thick=1)
 
         # ── Reset-confirmation overlay (after first 'R' press) ────────────────
         if now < reset_pending_until:
