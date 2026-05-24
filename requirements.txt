@@ -1,0 +1,6 @@
+# Python 3.12+ compatible (no TensorFlow needed)
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+insightface>=0.7.3
+onnxruntime>=1.16.0
+numpy>=1.23.0
