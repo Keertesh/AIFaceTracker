@@ -30,6 +30,7 @@ import urllib.request
 import pickle
 import queue
 import random
+import signal
 import subprocess
 import wave
 from collections import deque
@@ -968,7 +969,19 @@ def main():
     print("=" * 65)
     speaker.say("Face tracker started. Show me your face!", interrupt=True)
 
-    while True:
+    # Catch Ctrl+C cleanly — flip a flag, let the loop exit on its next
+    # iteration, then run the cleanup at the bottom of main(). Avoids the
+    # ugly KeyboardInterrupt traceback during cap.read().
+    _should_quit = threading.Event()
+    def _on_sigint(signum, frame_):
+        print("\n[INFO] Ctrl+C received — shutting down cleanly…")
+        _should_quit.set()
+    try:
+        signal.signal(signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        pass   # not on the main thread (won't happen here, but safe)
+
+    while not _should_quit.is_set():
         ret, frame = cap.read()
         if not ret:
             time.sleep(0.03)
