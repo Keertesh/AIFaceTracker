@@ -1,10 +1,12 @@
 """
-Face Tracker v3 — Voice-Enabled, Face Recognition
-====================================================
+Face Tracker v4 — 14-Emotion Detection + Voice Recognition
+============================================================
 • Face detection    : OpenCV Haar Cascade
 • Age + Gender      : InsightFace buffalo_s  (ONNX)
 • Face recognition  : InsightFace normed_embedding  (512-dim MobileFaceNet)
-• Emotion           : MediaPipe FaceLandmarker blendshapes  (52 ARKit)
+• Emotion (14)      : MediaPipe 52 ARKit blendshapes → muscle-group mapping
+    HAPPY · EXCITED · AMUSED · SAD · ANGRY · SURPRISED · SHOCKED
+    FEAR · DISGUSTED · CONTEMPT · CONFUSED · CONCENTRATING · BORED · NEUTRAL
 • Head pose         : Euler angles from MediaPipe transformation matrix
 • Voice output      : macOS `say` command  (non-blocking TTS)
 • Voice name input  : Prompted via terminal + spoken confirmation
@@ -46,29 +48,57 @@ GREEN    = (0,   210,  90)
 YELLOW   = (0,   210, 230)
 RED_DIM  = (60,  60,  200)
 
+# ── 14 emotions: colour (BGR) ─────────────────────────────────────────────────
 EMOTION_COLORS = {
-    "HAPPY":     (0,   215,  80),
-    "SAD":       (205,  65,   0),
-    "ANGRY":     (0,    20, 225),
-    "SURPRISED": (0,   175, 255),
-    "FEAR":      (165,   0, 165),
-    "DISGUSTED": (0,   115,  40),
-    "NEUTRAL":   (175, 175, 175),
+    # Positive
+    "HAPPY":         (0,   215,  80),   # bright green
+    "EXCITED":       (0,   230, 200),   # lime-yellow
+    "AMUSED":        (60,  200,  80),   # soft green
+    # Negative
+    "SAD":           (200,  55,   0),   # deep blue-orange
+    "ANGRY":         (0,    15, 230),   # vivid red
+    "DISGUSTED":     (0,   110,  35),   # dark green
+    "CONTEMPT":      (20,   70, 200),   # brick-orange
+    "BORED":         (105, 108, 118),   # muted slate
+    # Aroused / mixed
+    "SURPRISED":     (0,   175, 255),   # amber
+    "SHOCKED":       (0,   240, 250),   # bright yellow
+    "FEAR":          (160,   0, 160),   # purple
+    # Cognitive
+    "CONFUSED":      (0,   160, 230),   # warm orange
+    "CONCENTRATING": (175, 110,   0),   # steel blue
+    # Baseline
+    "NEUTRAL":       (170, 170, 170),   # neutral grey
 }
-EMOTIONS = ["HAPPY", "SAD", "ANGRY", "SURPRISED", "FEAR", "DISGUSTED", "NEUTRAL"]
 
-RECOGNITION_THRESHOLD = 0.38   # cosine sim threshold (normed embeddings)
-GREETING_COOLDOWN_S   = 25     # seconds between repeat greetings per person
+# Ordered for consistent bar rendering (positive → negative → aroused → cognitive)
+EMOTIONS = [
+    "HAPPY", "EXCITED", "AMUSED",
+    "SAD", "ANGRY", "DISGUSTED", "CONTEMPT", "BORED",
+    "SURPRISED", "SHOCKED", "FEAR",
+    "CONFUSED", "CONCENTRATING",
+    "NEUTRAL",
+]
 
-# Spoken emotion phrases (varied for naturalness)
+RECOGNITION_THRESHOLD = 0.38
+GREETING_COOLDOWN_S   = 25
+
+# Spoken phrases per emotion (variety for naturalness)
 _EMO_PHRASES = {
-    "HAPPY":     ["really happy", "full of joy", "absolutely joyful",  "so cheerful"],
-    "SAD":       ["a bit sad",    "feeling down", "a little blue",     "not so cheerful"],
-    "ANGRY":     ["quite angry",  "a bit angry",  "frustrated",        "upset"],
-    "SURPRISED": ["very surprised","shocked",     "quite startled",    "taken aback"],
-    "FEAR":      ["a bit scared", "nervous",      "quite anxious",     "a little afraid"],
-    "DISGUSTED": ["disgusted",    "put off by something", "displeased"],
-    "NEUTRAL":   ["calm",         "relaxed",      "pretty neutral",    "chilled out"],
+    "HAPPY":         ["really happy",        "full of joy",          "absolutely joyful",   "so cheerful"],
+    "EXCITED":       ["very excited",         "full of excitement",   "super pumped",        "buzzing with energy"],
+    "AMUSED":        ["amused",               "quite tickled",        "finding something funny", "entertained"],
+    "SAD":           ["a bit sad",            "feeling down",         "a little blue",       "not so cheerful"],
+    "ANGRY":         ["quite angry",          "a bit frustrated",     "upset about something","a little mad"],
+    "DISGUSTED":     ["disgusted",            "put off by something", "displeased",          "a bit repulsed"],
+    "CONTEMPT":      ["a bit contemptuous",   "somewhat scornful",    "a little smug",       "slightly dismissive"],
+    "BORED":         ["a bit bored",          "looking tired",        "not very engaged",    "a little sleepy"],
+    "SURPRISED":     ["quite surprised",      "caught off guard",     "rather startled",     "taken aback"],
+    "SHOCKED":       ["absolutely shocked",   "completely stunned",   "blown away",          "in total disbelief"],
+    "FEAR":          ["a bit scared",         "quite nervous",        "rather anxious",      "a little afraid"],
+    "CONFUSED":      ["confused",             "a bit puzzled",        "not quite sure about something", "perplexed"],
+    "CONCENTRATING": ["deep in thought",      "very focused",         "concentrating hard",  "in the zone"],
+    "NEUTRAL":       ["calm",                 "relaxed",              "pretty neutral",      "chilled out"],
 }
 
 _GREET_KNOWN = [
@@ -263,35 +293,116 @@ def _bs_dict(blendshapes) -> dict:
 
 
 def blendshapes_to_scores(blendshapes) -> dict:
+    """
+    Map 52 ARKit blendshape coefficients to 14 emotion scores [0-100].
+
+    Each emotion is grounded in distinct facial action units (AUs):
+      HAPPY         – bilateral zygomatic smile + Duchenne cheek squint
+      EXCITED       – big smile + wide eyes + open mouth  (high arousal)
+      AMUSED        – modest smile + knowing orbital squint (low arousal)
+      SAD           – depressor frown + corrugator brow raise + lip pull-down
+      ANGRY         – corrugator brow pull-down + orbicularis squint + frown
+      DISGUSTED     – levator nasi sneer + frown + brow compression
+      CONTEMPT      – *asymmetric* unilateral sneer / half-smile
+      BORED         – partial lid droop + slack, low-activation face
+      SURPRISED     – frontalis brow raise + eye-wide + jaw drop
+      SHOCKED       – all three surprise AUs simultaneously at peak
+      FEAR          – medial brow raise + scleral show + mouth stretch
+      CONFUSED      – *asymmetric* brow (one up / one down) + mild squint
+      CONCENTRATING – *symmetric* brow compression + squint + pressed lips
+      NEUTRAL       – residual when all others are low
+    """
     bs = _bs_dict(blendshapes)
 
-    def avg(*keys):
-        vals = [bs.get(k, 0) for k in keys]
-        return sum(vals) / max(len(vals), 1)
+    def g(*keys):
+        return sum(bs.get(k, 0) for k in keys) / max(len(keys), 1)
 
-    happy     = avg("mouthSmileLeft", "mouthSmileRight",
-                    "cheekSquintLeft", "cheekSquintRight")
-    sad       = avg("mouthFrownLeft", "mouthFrownRight") * 0.5 \
-              + bs.get("browInnerUp", 0) * 0.3 \
-              + avg("mouthLowerDownLeft", "mouthLowerDownRight") * 0.2
-    angry     = avg("browDownLeft", "browDownRight") * 0.55 \
-              + avg("eyeSquintLeft", "eyeSquintRight") * 0.25 \
-              + avg("mouthFrownLeft", "mouthFrownRight") * 0.20
-    surprised = bs.get("jawOpen", 0) * 0.45 \
-              + avg("eyeWideLeft", "eyeWideRight") * 0.35 \
-              + avg("browOuterUpLeft", "browOuterUpRight") * 0.20
-    fear      = avg("eyeWideLeft", "eyeWideRight") * 0.35 \
-              + bs.get("browInnerUp", 0) * 0.30 \
-              + bs.get("jawOpen", 0) * 0.20 \
-              + avg("mouthStretchLeft", "mouthStretchRight") * 0.15
-    disgusted = avg("noseSneerLeft", "noseSneerRight") * 0.55 \
-              + avg("mouthFrownLeft", "mouthFrownRight") * 0.30 \
-              + avg("browDownLeft", "browDownRight") * 0.15
+    def asym(lk, rk):
+        return abs(bs.get(lk, 0) - bs.get(rk, 0))
 
-    raw = {"HAPPY": happy, "SAD": sad, "ANGRY": angry,
-           "SURPRISED": surprised, "FEAR": fear, "DISGUSTED": disgusted}
-    raw["NEUTRAL"] = max(0.0, 1.0 - max(raw.values(), default=0) * 1.8)
+    # ── Primary AU groups ────────────────────────────────────────────────────
+    smile_l      = bs.get("mouthSmileLeft",  0)
+    smile_r      = bs.get("mouthSmileRight", 0)
+    smile_avg    = (smile_l + smile_r) / 2
+    smile_asym   = abs(smile_l - smile_r)
 
+    frown_avg    = g("mouthFrownLeft",    "mouthFrownRight")
+    cheek_sq     = g("cheekSquintLeft",   "cheekSquintRight")
+    brow_down    = g("browDownLeft",      "browDownRight")
+    brow_dn_asym = asym("browDownLeft",   "browDownRight")
+    brow_inner   = bs.get("browInnerUp", 0)
+    brow_outer   = g("browOuterUpLeft",   "browOuterUpRight")
+    brow_ou_asym = asym("browOuterUpLeft","browOuterUpRight")
+    eye_wide     = g("eyeWideLeft",       "eyeWideRight")
+    eye_squint   = g("eyeSquintLeft",     "eyeSquintRight")
+    eye_blink    = g("eyeBlinkLeft",      "eyeBlinkRight")
+    jaw_open     = bs.get("jawOpen", 0)
+    nose_sneer   = g("noseSneerLeft",     "noseSneerRight")
+    nose_asym    = asym("noseSneerLeft",  "noseSneerRight")
+    mouth_press  = g("mouthPressLeft",    "mouthPressRight")
+    mouth_str    = g("mouthStretchLeft",  "mouthStretchRight")
+    lip_lower    = g("mouthLowerDownLeft","mouthLowerDownRight")
+    brow_asym    = brow_dn_asym + brow_ou_asym
+
+    # ── 14 raw scores ────────────────────────────────────────────────────────
+    happy    = smile_avg * 0.60 + cheek_sq * 0.40
+
+    excited  = smile_avg * 0.42 + eye_wide * 0.30 + jaw_open * 0.18 \
+             + brow_outer * 0.10
+
+    # AMUSED: less smile than HAPPY, more eye squint (knowing look)
+    amused   = min(smile_avg, 0.55) * 0.46 + eye_squint * 0.34 + cheek_sq * 0.20
+
+    sad      = frown_avg * 0.48 + brow_inner * 0.32 + lip_lower * 0.20
+
+    angry    = brow_down * 0.52 + eye_squint * 0.28 + frown_avg * 0.20
+
+    disgusted = nose_sneer * 0.52 + frown_avg * 0.30 + brow_down * 0.18
+
+    # CONTEMPT: unilateral marker — asymmetry is the key discriminator
+    contempt = nose_asym * 0.48 + smile_asym * 0.38 \
+             + max(nose_sneer - 0.08, 0) * 0.14
+
+    # BORED: partial lid droop — scale so half-closed eyes (blink≈0.5) peak at 1.0
+    eye_droop = min(eye_blink * (1.0 - eye_blink) * 4.5, 1.0)
+    bored    = eye_droop * 0.55 + max(0.30 - smile_avg, 0) * 0.25 \
+             + max(0.30 - brow_inner, 0) * 0.20
+
+    surprised = jaw_open * 0.40 + eye_wide * 0.36 + brow_outer * 0.24
+
+    # SHOCKED: requires ALL THREE surprise AUs to exceed a high floor simultaneously.
+    # Using (x-floor)*(y-floor)*(z-floor) so it stays near zero for "merely surprised"
+    # and spikes only when jaw + eyes + brows are all at extreme amplitude.
+    _sj = max(jaw_open   - 0.55, 0)
+    _se = max(eye_wide   - 0.55, 0)
+    _sb = max(brow_outer - 0.48, 0)
+    shocked  = min(_sj * _se * _sb * 120, 1.0)
+
+    fear     = brow_inner * 0.32 + eye_wide * 0.30 + mouth_str * 0.22 \
+             + jaw_open * 0.16
+
+    # CONFUSED: asymmetric brow activity is the main signal
+    confused = min(brow_asym * 1.55, 1.0) * 0.52 + eye_squint * 0.28 \
+             + min(frown_avg, 0.35) * 0.20
+
+    # CONCENTRATING: symmetric brow pull-down; subtract asymmetry so it
+    # doesn't overlap with CONFUSED
+    concentrating = max(brow_down - brow_dn_asym * 0.65, 0) * 0.44 \
+                  + eye_squint * 0.34 + mouth_press * 0.22
+
+    raw_peak = max(happy, excited, amused, sad, angry, disgusted, contempt,
+                   bored, surprised, shocked, fear, confused, concentrating)
+    neutral  = max(0.0, 1.0 - raw_peak * 1.80)
+
+    raw = {
+        "HAPPY": happy, "EXCITED": excited, "AMUSED": amused,
+        "SAD": sad, "ANGRY": angry, "DISGUSTED": disgusted,
+        "CONTEMPT": contempt, "BORED": bored,
+        "SURPRISED": surprised, "SHOCKED": shocked, "FEAR": fear,
+        "CONFUSED": confused, "CONCENTRATING": concentrating,
+        "NEUTRAL": neutral,
+    }
+    raw  = {k: max(v, 0.0) for k, v in raw.items()}
     total = sum(raw.values()) + 1e-9
     return {k: float(v / total * 100) for k, v in raw.items()}
 
@@ -329,7 +440,7 @@ def est_distance(face_w: int, frame_w: int) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 class FaceState:
     def __init__(self):
-        self.scores   = {e: 100 / 7 for e in EMOTIONS}
+        self.scores   = {e: 100 / len(EMOTIONS) for e in EMOTIONS}
         self.timeline = deque(maxlen=180)
 
     def smooth(self, new_scores: dict, alpha=0.28):
@@ -404,14 +515,16 @@ def _face_mesh(img, landmarks, W, H, alpha=0.50):
     cv2.addWeighted(ov, alpha, img, 1 - alpha, 0, img)
 
 
-def _emotion_bars(img, scores, ox, oy, bw=108, bh=13, gap=6):
-    for i, emo in enumerate(EMOTIONS):
+def _emotion_bars(img, scores, ox, oy, bw=108, bh=10, gap=4):
+    """Draw compact horizontal bars for all 14 emotions, sorted by score."""
+    sorted_emos = sorted(EMOTIONS, key=lambda e: scores.get(e, 0), reverse=True)
+    for i, emo in enumerate(sorted_emos):
         by  = oy + i * (bh + gap)
-        col = EMOTION_COLORS[emo]
+        col = EMOTION_COLORS.get(emo, DIM)
         pct = scores.get(emo, 0)
         _hbar(img, ox, by, bw, bh, pct, col)
-        _stxt(img, f"{emo[:7]:<7} {pct:4.0f}%",
-              ox + bw + 5, by + bh - 1, col, scale=0.38)
+        _stxt(img, f"{emo[:8]:<8}  {pct:4.0f}%",
+              ox + bw + 5, by + bh - 1, col, scale=0.36)
 
 
 def _pose_compass(img, yaw, pitch, cx, cy, r=28):
@@ -934,8 +1047,8 @@ def main():
             # Emotion bars (right of face)
             bx = x + w + 12
             if bx + 244 < W:
-                bph = len(EMOTIONS) * (13 + 6) + 10
-                _panel(display, bx-6, y-4, 244, bph, border=(52, 58, 72))
+                bph = len(EMOTIONS) * (10 + 4) + 12
+                _panel(display, bx-6, y-4, 250, bph, border=(52, 58, 72))
                 _emotion_bars(display, scores, bx, y, bw=108)
 
         # ── Timeline ──────────────────────────────────────────────────────────
